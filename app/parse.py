@@ -4,8 +4,12 @@ import csv
 import re
 from typing import Iterable
 
-import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions
 
 
 BASE_URL = "https://webscraper.io/"
@@ -25,141 +29,148 @@ _PRICE_RE = re.compile(r"[-+]?\d*\.?\d+")
 _REVIEWS_RE = re.compile(r"(\d+)")
 
 
-def _to_float_price(text: str) -> float:
-    text = text.replace(",", "")
-    match_obj = _PRICE_RE.search(text)
+def _parse_price(text: str) -> float:
+    cleaned = text.replace(",", "")
+    match_obj = _PRICE_RE.search(cleaned)
     return float(match_obj.group(0)) if match_obj else 0.0
 
 
-def _to_int_reviews(text: str) -> int:
+def _parse_reviews(text: str) -> int:
     match_obj = _REVIEWS_RE.search(text)
     return int(match_obj.group(1)) if match_obj else 0
 
 
-def _extract_rating(block: BeautifulSoup) -> int:
-    rated = block.select_one("[data-rating]")
-    if rated and rated.has_attr("data-rating"):
-        try:
-            return int(str(rated["data-rating"]).strip())
-        except Exception:
-            pass
-
-    stars = block.select(".glyphicon-star, .ws-icon-star, .fa-star")
-    if stars:
-        return len(stars)
-
-    return 0
-
-
 def _parse_products_from_html(html: str) -> list[Product]:
     soup = BeautifulSoup(html, "html.parser")
-
     blocks = soup.select("div.thumbnail")
-    if not blocks:
-        blocks = soup.select("div.product-wrapper")
-    if not blocks:
-        blocks = soup.select("div.col-sm-4.col-lg-4.col-md-4")
 
     products: list[Product] = []
+
     for block in blocks:
-        title_el = (block.select_one("a.title")
-                    or block.select_one("h4 a")
-                    or block.select_one("a"))
-        desc_el = (block.select_one("p.description")
-                   or block.select_one("p.caption")
-                   or block.select_one("p"))
-        price_el = (block.select_one("h4.price")
-                    or block.select_one("h4.pull-right")
-                    or block.select_one("h4"))
+        title_el = block.select_one("a.title")
+        desc_el = block.select_one("p.description")
+        price_el = block.select_one("h4.price")
+        reviews_el = block.select_one("p.review-count")
+        rating_el = block.select_one("[data-rating]")
 
-        reviews_el = (block.select_one("p.review-count")
-                      or block.select_one(".ratings p.pull-right")
-                      or block.select_one("p.pull-right"))
+        if not (title_el and desc_el and price_el):
+            continue
 
-        title = title_el.get_text(strip=True) if title_el else ""
-        description = desc_el.get_text(" ", strip=True) if desc_el else ""
-        price = _to_float_price(price_el.get_text(strip=True))\
-            if price_el else 0.0
-        num_reviews = _to_int_reviews(reviews_el.get_text(strip=True))\
-            if reviews_el else 0
-        rating = _extract_rating(block)
+        rating = int(rating_el["data-rating"]) if rating_el else 0
 
-        if title and description and price_el:
-            products.append(
-                Product(
-                    title=title,
-                    description=description,
-                    price=price,
-                    rating=rating,
-                    num_of_reviews=num_reviews,
-                )
+        products.append(
+            Product(
+                title=title_el.get_text(strip=True),
+                description=desc_el.get_text(strip=True),
+                price=_parse_price(price_el.get_text()),
+                rating=rating,
+                num_of_reviews=_parse_reviews(reviews_el.get_text()
+                                              if reviews_el else "0"),
             )
+        )
+
     return products
 
 
-def _find_more_url(html: str, current_url: str) -> str | None:
-    soup = BeautifulSoup(html, "html.parser")
-    more = soup.select_one("a.ecomerce-items-scroll-more")
-    if not more or not more.get("href"):
-        return None
-    return urljoin(current_url, more["href"])
+def _click_accept_cookies(driver: webdriver.Chrome) -> None:
+    try:
+        accept_btn = WebDriverWait(driver, 3).until(
+            expected_conditions.element_to_be_clickable
+            ((By.XPATH, "//button[contains(., 'Accept')]"))
+        )
+        accept_btn.click()
+    except Exception:
+        pass
 
 
-def _scrape_page(url: str, follow_more: bool, session: requests.Session) \
+def _load_all_products(driver: webdriver.Chrome) -> None:
+    wait = WebDriverWait(driver, 10)
+
+    while True:
+        try:
+            more_button = wait.until(
+                expected_conditions.presence_of_element_located
+                ((By.CSS_SELECTOR, "a.ecomerce-items-scroll-more"))
+            )
+        except Exception:
+            break
+
+        if not more_button.is_displayed():
+            break
+
+        current_count = len(driver.find_elements
+                            (By.CSS_SELECTOR, "div.thumbnail"))
+        more_button.click()
+
+        try:
+            wait.until(
+                lambda d: len(
+                    d.find_elements(
+                        By.CSS_SELECTOR, "div.thumbnail")) > current_count
+            )
+        except Exception:
+            break
+
+
+def _scrape_page(driver: webdriver.Chrome, url: str, load_all: bool) \
         -> list[Product]:
-    products: list[Product] = []
-    seen_urls: set[str] = set()
+    driver.get(url)
 
-    next_url: str | None = url
-    while next_url and next_url not in seen_urls:
-        seen_urls.add(next_url)
+    WebDriverWait(driver, 10).until(
+        expected_conditions.presence_of_element_located(
+            (By.CSS_SELECTOR, "div.thumbnail"))
+    )
 
-        resp = session.get(next_url, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
+    _click_accept_cookies(driver)
 
-        products.extend(_parse_products_from_html(html))
+    if load_all:
+        _load_all_products(driver)
 
-        if follow_more:
-            next_url = _find_more_url(html, next_url)
-        else:
-            next_url = None
-
-    return products
+    html = driver.page_source
+    return _parse_products_from_html(html)
 
 
 def _write_csv(products: Iterable[Product], filename: str) -> None:
-    products = list(products)
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["title", "description", "price",
-                                               "rating", "num_of_reviews"])
+    with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=["title",
+                        "description",
+                        "price",
+                        "rating",
+                        "num_of_reviews"],
+        )
         writer.writeheader()
         for product in products:
             writer.writerow(asdict(product))
 
 
+def get_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1920,1080")
+    return webdriver.Chrome(options=options)
+
+
 def get_all_products() -> None:
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome Safari",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-    )
+    driver = get_driver()
 
-    pages = [
-        ("home.csv", HOME_URL, False),
-        ("computers.csv", urljoin(HOME_URL, "computers"), False),
-        ("laptops.csv", urljoin(HOME_URL, "computers/laptops"), True),
-        ("tablets.csv", urljoin(HOME_URL, "computers/tablets"), True),
-        ("phones.csv", urljoin(HOME_URL, "phones"), False),
-        ("touch.csv", urljoin(HOME_URL, "phones/touch"), True),
-    ]
+    try:
+        pages = [
+            ("home.csv", HOME_URL, False),
+            ("computers.csv", urljoin(HOME_URL, "computers"), False),
+            ("laptops.csv", urljoin(HOME_URL, "computers/laptops"), True),
+            ("tablets.csv", urljoin(HOME_URL, "computers/tablets"), True),
+            ("phones.csv", urljoin(HOME_URL, "phones"), False),
+            ("touch.csv", urljoin(HOME_URL, "phones/touch"), True),
+        ]
 
-    for filename, url, follow_more in pages:
-        products = _scrape_page(url, follow_more=follow_more, session=session)
-        _write_csv(products, filename)
+        for filename, url, load_all in pages:
+            products = _scrape_page(driver, url, load_all)
+            _write_csv(products, filename)
+
+    finally:
+        driver.quit()
 
 
 if __name__ == "__main__":
